@@ -1796,6 +1796,14 @@ class AudioPlayer {
     }
   }
 
+  /// Expose the proxy stop function to be able to recover from a bug on iOS
+  /// where this local proxy loses connection without being flagged as closed
+  /// when app has been in background for about half a minute. Originally from
+  /// the fork https://github.com/Loknar/just_audio/.
+  Future<void> proxyStop() async {
+    await _proxy.stop();
+  }
+
   Exception _convertException(PlatformException e) {
     const kUnknownErrorCode = 9999999;
     const kInterruptedErrorCode = 10000000;
@@ -1815,6 +1823,7 @@ class AudioPlayer {
       return PlayerException(code, e.message, index);
     }
   }
+
 }
 
 /// Captures the details of any error accessing, loading or playing an audio
