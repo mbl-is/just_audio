@@ -3515,6 +3515,37 @@ class LockCachingAudioSource extends StreamAudioSource {
       }
     }
 
+    var failed = false;
+
+    /// Ends the download after an error: fails the pending requests and the
+    /// responses in progress, and resets the state so that the next request
+    /// starts a new download. A file system error here must not stop that
+    /// cleanup or hide the original error.
+    Future<void> fail(Object e, StackTrace stackTrace) async {
+      if (failed) return;
+      failed = true;
+      _response = null;
+      await subscription.cancel();
+      httpClient.close();
+      await sink.close().catchError((dynamic _) {});
+      try {
+        partialCacheFile.deleteSync();
+      } on FileSystemException {
+        // already gone, e.g. the OS cleared the cache directory
+      }
+      // Fail all pending requests
+      for (final req in _requests) {
+        req.fail(e, stackTrace);
+      }
+      _requests.clear();
+      // Close all in progress requests
+      for (final res in inProgressResponses) {
+        res.controller.addError(e, stackTrace);
+        res.controller.close();
+      }
+      _downloading = false;
+    }
+
     _progress = 0;
     subscription = response.listen((data) async {
       _progress += data.length;
@@ -3555,7 +3586,14 @@ class LockCachingAudioSource extends StreamAudioSource {
       // Prevent further data coming from the HTTP source until we have set up
       // an entry in inProgressResponses to continue receiving live HTTP data.
       subscription.pause();
-      await sink.flush();
+      try {
+        await sink.flush();
+      } catch (e, stackTrace) {
+        // e.g. the disk is full. The subscription was just paused, so without
+        // this the download would stall and the requests never complete.
+        await fail(e, stackTrace);
+        return;
+      }
       // Process any requests that start within the cache.
       for (var request in readyRequests) {
         _requests.remove(request);
@@ -3636,25 +3674,24 @@ class LockCachingAudioSource extends StreamAudioSource {
           cacheResponse.controller.close();
         }
       }
-      (await _partialCacheFile).renameSync(cacheFile.path);
+      try {
+        partialCacheFile.renameSync(cacheFile.path);
+      } on FileSystemException {
+        // The partial file was removed during the download, e.g. by the OS
+        // clearing the cache directory. The responses above were served from
+        // memory, but nothing is cached, so download again next time rather
+        // than reuse this response.
+        _response = null;
+        sink.close().catchError((dynamic _) {});
+      }
       await subscription.cancel();
       httpClient.close();
       _downloading = false;
-    }, onError: (Object e, StackTrace stackTrace) async {
-      (await _partialCacheFile).deleteSync();
-      httpClient.close();
-      // Fail all pending requests
-      for (final req in _requests) {
-        req.fail(e, stackTrace);
-      }
-      _requests.clear();
-      // Close all in progress requests
-      for (final res in inProgressResponses) {
-        res.controller.addError(e, stackTrace);
-        res.controller.close();
-      }
-      _downloading = false;
-    }, cancelOnError: true);
+    }, onError: fail, cancelOnError: true);
+    // A write error, e.g. a full disk, also completes the sink's done future
+    // with an error. While no request is waiting, flush() isn't called, so this
+    // is the only place it shows up, and unhandled it would be uncaught.
+    sink.done.catchError(fail);
     return response;
   }
 
